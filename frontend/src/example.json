@@ -1,0 +1,193 @@
+{
+  "title": "Office interview",
+  "description": "Two people sit opposite each other across a round table. A door is behind Ravi, and a window behind Asha.",
+  "objects": [
+    {
+      "id": "asha",
+      "name": "Asha",
+      "kind": "character",
+      "position": [
+        0,
+        0,
+        1.15
+      ],
+      "dimensions": [
+        0.6,
+        1.4,
+        0.6
+      ],
+      "color": "#c58a64",
+      "rotation": 180,
+      "pose": "seated"
+    },
+    {
+      "id": "ravi",
+      "name": "Ravi",
+      "kind": "character",
+      "position": [
+        0,
+        0,
+        -1.15
+      ],
+      "dimensions": [
+        0.6,
+        1.4,
+        0.6
+      ],
+      "color": "#758f91",
+      "rotation": 0,
+      "pose": "seated"
+    },
+    {
+      "id": "round-table",
+      "name": "Round Table",
+      "kind": "table",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "dimensions": [
+        1.5,
+        0.8,
+        1.5
+      ],
+      "color": "#b2966f",
+      "rotation": 0,
+      "shape": "round"
+    },
+    {
+      "id": "chair-a",
+      "name": "Chair A",
+      "kind": "chair",
+      "position": [
+        0,
+        0,
+        1.15
+      ],
+      "dimensions": [
+        0.6,
+        0.95,
+        0.65
+      ],
+      "color": "#758f91",
+      "rotation": 180
+    },
+    {
+      "id": "chair-b",
+      "name": "Chair B",
+      "kind": "chair",
+      "position": [
+        0,
+        0,
+        -1.15
+      ],
+      "dimensions": [
+        0.6,
+        0.95,
+        0.65
+      ],
+      "color": "#758f91",
+      "rotation": 0
+    },
+    {
+      "id": "door",
+      "name": "Door",
+      "kind": "door",
+      "position": [
+        0,
+        0,
+        -2.94
+      ],
+      "dimensions": [
+        1.1,
+        2.2,
+        0.06
+      ],
+      "color": "#507b73",
+      "rotation": 0
+    },
+    {
+      "id": "window",
+      "name": "Window",
+      "kind": "window",
+      "position": [
+        0,
+        0.9,
+        2.94
+      ],
+      "dimensions": [
+        1.8,
+        1.4,
+        0.06
+      ],
+      "color": "#9cd0e3",
+      "rotation": 0
+    }
+  ],
+  "shots": [
+    {
+      "id": "ravi-close",
+      "name": "Ravi Close",
+      "position": [
+        0.7,
+        1.55,
+        2.4
+      ],
+      "target": [
+        0,
+        1.15,
+        -1.15
+      ],
+      "fov": 55,
+      "roll": 0,
+      "action": "Subtle conversation. Preserve the composition and room layout. Static camera."
+    },
+    {
+      "id": "asha-reverse",
+      "name": "Asha Reverse",
+      "position": [
+        0.7,
+        1.55,
+        -2.4
+      ],
+      "target": [
+        0,
+        1.15,
+        1.15
+      ],
+      "fov": 55,
+      "roll": 0,
+      "action": "Subtle conversation. Preserve the composition and room layout. Static camera."
+    },
+    {
+      "id": "wide",
+      "name": "Wide",
+      "position": [
+        2.6,
+        2.4,
+        2.5
+      ],
+      "target": [
+        0,
+        0.9,
+        0
+      ],
+      "fov": 55,
+      "roll": 0,
+      "action": "Subtle conversation. Preserve the composition and room layout. Static camera."
+    }
+  ],
+  "version": 2,
+  "room": {
+    "width": 6,
+    "height": 3,
+    "depth": 6
+  },
+  "assumptions": [
+    "Hand-authored example for testing; not generated from the text box.",
+    "Door and window are filled markers on walls."
+  ],
+  "unsupported": [],
+  "relations": []
+}

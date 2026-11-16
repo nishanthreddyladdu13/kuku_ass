@@ -1,0 +1,18 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> cinecontrol-ai@0.1.0 test
+> node --import tsx --test tests/*.test.ts
+
+✔ Different scenes preserve schema through serialization (7.279028ms)
+✔ Movement changes only moving object and leaves source unchanged (0.815829ms)
+✔ Round and rectangular table use different geometry (7.381362ms)
+✔ Five sampled rendered depths agree with independent ray intersections (52.007335ms)
+✔ All three sets render different previews (9.16727ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 442.580869
