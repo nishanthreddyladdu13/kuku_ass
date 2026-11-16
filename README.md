@@ -33,7 +33,8 @@ LLM_PROVIDER=gemini
 LLM_MODEL=your_available_structured_output_model_id
 LLM_API_KEY=your_key_here
 LLM_BASE_URL=
-IMAGE_MODEL=gemini-nano-banana-2.1
+IMAGE_MODEL=core
+STABILITY_API_KEY=your_stability_key_here
 ```
 
 Select a model ID actually available to your Google API account. No model is silently assumed. Restart FastAPI after editing. The provider uses the configured `LLM_MODEL` with Gemini's `generateContent` REST endpoint via HTTPX; no SDK installation is needed. A live response must satisfy the Pydantic JSON schema. Structured output is capped at 4096 tokens. One repair attempt is allowed. Gemini HTTP 503 responses receive at most three total provider requests per scene, including a repair request, with jittered exponential backoff; each request is bounded to 20 seconds and the full scene to 70 seconds. Logs record stage timings and request/schema sizes without logging prompts, API keys or request headers. New input generation returns an explicit error without configured access.
@@ -51,7 +52,7 @@ A ChatGPT subscription is not automatically an API credential. Never paste keys 
 
 ## Generate a scene image
 
-The scene workspace can generate one image for the selected shot. `POST /api/scene-image` accepts the current validated `scene` and a `shot_id`, then builds a cinematic prompt from the scene layout and that shot's camera/action. The request uses the existing server-side `LLM_API_KEY` and Gemini's Interactions API; the key is never sent to the browser. `IMAGE_MODEL` optionally selects an image-capable Gemini model and defaults to `gemini-nano-banana-2.1`. The image request is made once (no retries) and has a 120-second upstream timeout and a 130-second overall deadline. The response includes the image MIME type and base64 data. Generated images are review drafts; the frontend displays them and includes them in the exported reference pack.
+The scene workspace can generate an image for the selected shot. `POST /api/scene-image` accepts the validated scene and shot ID; `POST /api/scene-image/upload` can additionally take a PNG/JPEG/WebP reference frame. Both use a server-side `STABILITY_API_KEY`; `IMAGE_MODEL` selects Stability's `core` or `ultra` text-to-image model. The image request is made once (no retries), bounded by a 120-second upstream timeout and a 135-second overall deadline. The response includes image MIME type and base64 data. Generated images are review drafts; the frontend displays them and includes them in the exported reference pack.
 
 ## Development: two terminals
 
@@ -89,13 +90,15 @@ Open http://localhost:5173. Vite proxies `/api` to FastAPI. Rebuild with `npm.cm
 
 ## Implemented scope
 
-One rectangular room; 1–4 principal characters; up to 20 objects and 4 shots. Supported kinds: character, table, chair, sofa, bed, counter, shelf, door, window, box. Round/rectangular tables; configurable dimensions and rotations; standing/seated proxies; straight-line position interpolation. Object/room editing, camera editing, JSON import/export and reload persistence.
+One rectangular room; 1–4 principal characters; up to 20 objects and 4 shots. Supported kinds: character, table, chair, sofa, bed, counter, shelf, door, window, box. Round/rectangular tables; configurable dimensions and rotations; standing/seated proxies. The shared animation timeline supports deterministic object move/rotate/scale/appear/disappear tracks and per-shot camera pan/tilt/dolly/track/zoom tracks. Timeline tracks are validated for references, continuity, channel conflicts and room bounds. The player supports play, pause, restart, seek and playback speed; the Handoff tab uses the browser's native video controls for imported clips.
+
+Character meshes are unrigged proxies: movement is linear blocking, not a walk/run cycle. Jump arcs, gestures, grasping, facial animation, orbit cameras, pathfinding and physics are not implemented and must be recorded as unsupported rather than claimed as animated.
 
 Units: metres. Origin: room centre. +Y up. Object position: bottom centre. Rotation: degrees around Y; zero faces +Z. World left/right uses X. Door/window are solid visual panels on walls, not openings for navigation. The room has an open ceiling for overview inspection.
 
 ## Data flow
 
-React text -> POST `/api/scene` -> server-side model -> Pydantic validation/one repair -> scene JSON -> frontend Zod validation -> Three.js -> user edits -> PNG/JSON/ZIP. A selected scene/shot can also go to POST `/api/scene-image` -> server-side Gemini image model -> reviewed image preview/export.
+React text -> POST `/api/scene` -> server-side model -> Pydantic validation/one repair -> scene JSON -> frontend Zod validation -> Three.js timeline player -> user edits -> PNG/JSON/ZIP. A selected scene/shot can also go to POST `/api/scene-image` -> server-side Stability image model -> reviewed image preview/export.
 
 - GET `/api/health`: configuration status (never keys).
 - GET `/api/examples`: local sample scenes.

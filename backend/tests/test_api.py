@@ -26,6 +26,57 @@ class ApiTests(unittest.TestCase):
         p=self.example;p['objects']=[p['objects'][0],dict(p['objects'][2],kind='bed',shape='rectangular')]
         p['room']={'width':8,'depth':5,'height':3}
         self.assertEqual(self.client.post('/api/validate',json=p).status_code,200)
+    def test_animation_timeline_validates_targets_and_continuity(self):
+        obj=self.example['objects'][0]
+        shot=self.example['shots'][0]
+        end=[obj['position'][0]+0.25,obj['position'][1],obj['position'][2]]
+        self.example['shots'][0].update(start_time=1,duration=3)
+        self.example['animations']=[
+            {'id':'move-character','object_id':obj['id'],'type':'move','start_time':0,'duration':2,'from_position':obj['position'],'to_position':end},
+            {'id':'camera-zoom','target_type':'camera','shot_id':shot['id'],'type':'zoom','start_time':0,'duration':2,'from_fov':shot['fov'],'to_fov':shot['fov']+5},
+        ]
+        response=self.client.post('/api/validate',json=self.example)
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertEqual(response.json()['scene']['animations'][0]['object_id'],obj['id'])
+        self.assertEqual(response.json()['scene']['shots'][0]['start_time'],1)
+    def test_scene_prompt_uses_animations_as_single_movement_source(self):
+        self.assertIn('Use scene.animations as the single source of truth for animated movement.',main.SYSTEM)
+        self.assertIn('For any object with a move animation, set object.motion to null.',main.SYSTEM)
+        self.assertIn('Represent each movement exactly once.',main.SYSTEM)
+    def test_exact_duplicate_legacy_motion_is_normalized_to_animation(self):
+        obj=self.example['objects'][0]
+        start=obj['position']
+        end=[start[0]+0.2,start[1],start[2]]
+        obj['motion']={'end_position':end,'duration':4}
+        self.example['animations']=[{'id':'move-character','object_id':obj['id'],'type':'move','start_time':0,'duration':4,'from_position':start,'to_position':end}]
+        with patch.object(main,'invoke',new=AsyncMock(return_value=json.dumps(self.example))) as mock:
+            response=self.client.post('/api/scene',json={'script':'A person moves a short distance across the room.'})
+        self.assertEqual(response.status_code,200,response.text)
+        scene=response.json()['scene']
+        normalized=next(item for item in scene['objects'] if item['id']==obj['id'])
+        self.assertIsNone(normalized['motion'])
+        self.assertEqual(scene['animations'][0]['type'],'move')
+        self.assertEqual(mock.await_count,1)
+        record=json.loads(next(Path(self.temp.name).glob('*.json')).read_text())
+        self.assertEqual(record['attempts'][0]['normalizations'][0]['type'],'duplicate_legacy_motion_removed')
+    def test_nonidentical_legacy_motion_is_not_normalized(self):
+        obj=self.example['objects'][0]
+        start=obj['position']
+        motion_end=[start[0]+0.2,start[1],start[2]]
+        animation_end=[start[0]+0.4,start[1],start[2]]
+        obj['motion']={'end_position':motion_end,'duration':4}
+        self.example['animations']=[{'id':'move-character','object_id':obj['id'],'type':'move','start_time':0,'duration':4,'from_position':start,'to_position':animation_end}]
+        raw=json.dumps(self.example)
+        candidate,normalized=main.normalize_duplicate_legacy_motions(raw)
+        self.assertEqual(candidate,raw)
+        self.assertEqual(normalized,[])
+    def test_animation_rejects_missing_target_or_discontinuous_start(self):
+        obj=self.example['objects'][0]
+        self.example['animations']=[{'id':'bad-move','object_id':'missing','type':'move','start_time':0,'duration':2,'from_position':obj['position'],'to_position':[obj['position'][0]+0.2,obj['position'][1],obj['position'][2]]}]
+        self.assertEqual(self.client.post('/api/validate',json=self.example).status_code,422)
+        self.example['animations'][0]['object_id']=obj['id']
+        self.example['animations'][0]['from_position']=[obj['position'][0]+1,obj['position'][1],obj['position'][2]]
+        self.assertEqual(self.client.post('/api/validate',json=self.example).status_code,422)
     def test_missing_credentials_explicit(self):
         with patch.dict(os.environ,{'LLM_API_KEY':'','LLM_MODEL':''}):
             r=self.client.post('/api/scene',json={'script':'A new person beside a counter.'})
@@ -85,59 +136,42 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(record['provider_requests'][0]['model'],record['model'])
     def test_scene_image_uses_configured_model_and_returns_image(self):
         image_data='aGVsbG8='
-        response=httpx.Response(200,json={'output_image':{'data':image_data,'mime_type':'image/png'}},request=httpx.Request('POST','https://generativelanguage.googleapis.com/v1beta/interactions'))
-        class FakeClient:
-            async def __aenter__(self): return self
-            async def __aexit__(self,*args): return False
-            async def post(self,url,headers,json):
-                self.url=url;self.headers=headers;self.payload=json
-                return response
-        fake=FakeClient()
-        with patch.dict(os.environ,{'LLM_API_KEY':'test-key','IMAGE_MODEL':'test-image-model','LLM_PROVIDER':'gemini'}),patch.object(main.httpx,'AsyncClient',return_value=fake):
+        async def fake_invoke(prompt,model,request_log,reference_image=None):
+            request_log.update(effective_model='core',image_bytes=5)
+            return 'image/png',image_data
+        with patch.dict(os.environ,{'STABILITY_API_KEY':'test-key','IMAGE_MODEL':'core'}),patch.object(main,'invoke_image',new=AsyncMock(side_effect=fake_invoke)) as mock:
             r=self.client.post('/api/scene-image',json={'scene':self.example,'shot_id':self.example['shots'][0]['id']})
         self.assertEqual(r.status_code,200,r.text)
-        self.assertEqual(r.json(),{'model':'test-image-model','mime_type':'image/png','data_base64':image_data})
-        self.assertEqual(fake.url,'https://generativelanguage.googleapis.com/v1beta/interactions')
-        self.assertEqual(fake.headers['Api-Revision'],'2026-05-20')
-        self.assertEqual(fake.payload['model'],'test-image-model')
-        self.assertFalse(fake.payload['store'])
-        self.assertIn(self.example['title'],fake.payload['input'][0]['text'])
-        self.assertIn(self.example['shots'][0]['name'],fake.payload['input'][0]['text'])
-        self.assertIn(self.example['shots'][0]['action'],fake.payload['input'][0]['text'])
-        self.assertIn('Assumptions:',fake.payload['input'][0]['text'])
-        self.assertIn('Unsupported elements:',fake.payload['input'][0]['text'])
+        self.assertEqual(r.json()['model'],'core')
+        self.assertEqual(r.json()['mime_type'],'image/png')
+        self.assertEqual(r.json()['data_base64'],image_data)
+        self.assertEqual(r.json()['provider'],'stability')
+        self.assertEqual(r.json()['shot_id'],self.example['shots'][0]['id'])
+        prompt=mock.await_args.args[0]
+        self.assertIn(self.example['title'],prompt)
+        self.assertIn(self.example['shots'][0]['name'],prompt)
+        self.assertIn(self.example['shots'][0]['action'],prompt)
         self.assertNotIn('test-key',r.text)
     def test_scene_image_reports_upstream_503_without_retry(self):
-        request=httpx.Request('POST','https://generativelanguage.googleapis.com/v1beta/interactions')
-        response=httpx.Response(503,json={'error':{'status':'UNAVAILABLE','message':'Image service is busy.'}},request=request)
-        class FakeClient:
-            calls=0
-            async def __aenter__(self): return self
-            async def __aexit__(self,*args): return False
-            async def post(self,*args,**kwargs):
-                self.calls+=1
-                return response
-        fake=FakeClient()
-        with patch.dict(os.environ,{'LLM_API_KEY':'test-key','IMAGE_MODEL':'test-image-model'}),patch.object(main.httpx,'AsyncClient',return_value=fake):
+        request=httpx.Request('POST','https://api.stability.ai/v2beta/stable-image/generate/core')
+        response=httpx.Response(503,json={'message':'Image service is busy.'},request=request)
+        error=httpx.HTTPStatusError('upstream error',request=request,response=response)
+        with patch.dict(os.environ,{'STABILITY_API_KEY':'test-key','IMAGE_MODEL':'core'}),patch.object(main,'invoke_image',new=AsyncMock(side_effect=error)) as mock:
             r=self.client.post('/api/scene-image',json={'scene':self.example,'shot_id':self.example['shots'][0]['id']})
         self.assertEqual(r.status_code,503)
-        self.assertIn('UNAVAILABLE',r.json()['detail'])
-        self.assertIn('after 1 attempt(s)',r.json()['detail'])
-        self.assertEqual(fake.calls,1)
+        self.assertIn('Image service is busy',r.json()['detail'])
+        self.assertEqual(mock.await_count,1)
     def test_scene_image_surfaces_upstream_quota_429(self):
-        request=httpx.Request('POST','https://generativelanguage.googleapis.com/v1beta/interactions')
-        response=httpx.Response(429,json={'error':{'status':'RESOURCE_EXHAUSTED','message':'Free Tier limit is zero requests per day.'}},request=request)
-        class FakeClient:
-            async def __aenter__(self): return self
-            async def __aexit__(self,*args): return False
-            async def post(self,*args,**kwargs): return response
-        with patch.dict(os.environ,{'LLM_API_KEY':'test-key','IMAGE_MODEL':'test-image-model'}),patch.object(main.httpx,'AsyncClient',return_value=FakeClient()):
+        request=httpx.Request('POST','https://api.stability.ai/v2beta/stable-image/generate/core')
+        response=httpx.Response(429,json={'message':'Daily image quota exceeded.'},request=request)
+        error=httpx.HTTPStatusError('upstream error',request=request,response=response)
+        with patch.dict(os.environ,{'STABILITY_API_KEY':'test-key','IMAGE_MODEL':'core'}),patch.object(main,'invoke_image',new=AsyncMock(side_effect=error)):
             r=self.client.post('/api/scene-image',json={'scene':self.example,'shot_id':self.example['shots'][0]['id']})
         self.assertEqual(r.status_code,429)
-        self.assertIn('zero requests per day',r.json()['detail'])
+        self.assertIn('Daily image quota exceeded',r.json()['detail'])
         self.assertNotIn('test-key',r.text)
     def test_scene_image_reports_timeout(self):
-        with patch.dict(os.environ,{'LLM_API_KEY':'test-key','IMAGE_MODEL':'test-image-model'}),patch.object(main,'invoke_image',new=AsyncMock(side_effect=httpx.ReadTimeout('timed out'))) as mock:
+        with patch.dict(os.environ,{'STABILITY_API_KEY':'test-key','IMAGE_MODEL':'core'}),patch.object(main,'invoke_image',new=AsyncMock(side_effect=httpx.ReadTimeout('timed out'))) as mock:
             r=self.client.post('/api/scene-image',json={'scene':self.example,'shot_id':self.example['shots'][0]['id']})
         self.assertEqual(r.status_code,504)
         self.assertIn('timed out',r.json()['detail'])
