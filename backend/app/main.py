@@ -1,16 +1,17 @@
 from pathlib import Path
-import os, json, uuid, time, asyncio
+import os, json, uuid, time, asyncio, base64
 import logging, random
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
-from .models import Scene, SceneRequest, spatial_warnings
+from .models import Scene, SceneRequest, SceneImageRequest, Shot, spatial_warnings
 
 BASE=Path(__file__).resolve().parents[1]
-load_dotenv(BASE/'.env')
+# load_dotenv(BASE/'.env')
+load_dotenv(BASE / '.env', override=True)
 app=FastAPI(title='CineControl API',version='0.2.0')
 app.add_middleware(CORSMiddleware,allow_origins=['http://localhost:5173','http://127.0.0.1:5173'],allow_methods=['GET','POST'],allow_headers=['Content-Type'])
 DATA=BASE/'data'/'runs'
@@ -21,6 +22,10 @@ RETRY_BACKOFF_BASE_SECONDS=0.5
 MAX_RETRY_BACKOFF_SECONDS=2
 SCENE_RESPONSE_DEADLINE_SECONDS=70
 MAX_OUTPUT_TOKENS=4096
+DEFAULT_IMAGE_MODEL='core'
+IMAGE_REQUEST_TIMEOUT_SECONDS=120
+IMAGE_RESPONSE_DEADLINE_SECONDS=135
+MAX_REFERENCE_IMAGE_BYTES=10*1024*1024
 logger=logging.getLogger(__name__)
 SYSTEM = """
 You are a spatial scene planner for a film previsualization application.
@@ -180,6 +185,123 @@ def gemini_response_schema()->dict:
 
     return normalize(source)
 
+def build_image_prompt(scene:Scene,shot:Shot,has_reference:bool=False)->str:
+    """Turn a shot's action prompt + 3D blocking into a Stability text prompt.
+
+    Action comes first so it cannot be truncated even for complex scenes.
+    The full Pydantic scene stays in the app; text-to-image cannot enforce
+    numerical 3D positions perfectly.
+    """
+    object_lines=[]
+    for obj in scene.objects:
+        line=(
+            f"- {obj.name} ({obj.kind}); world position {list(obj.position)} m, "
+            f"size {list(obj.dimensions)} m, facing {obj.rotation} degrees, "
+            f"color {obj.color}, pose {obj.pose}."
+        )
+        if obj.motion:
+            line+=f" Moving toward {list(obj.motion.end_position)} in {obj.motion.duration}s."
+        object_lines.append(line)
+
+    relation_lines=[f"- {r.subject} {r.relation.replace('_',' ')} {r.target}" for r in scene.relations]
+    frame_guidance=(
+        "Render exactly one cinematic frame, preserving the attached reference composition."
+        if has_reference else "Render exactly one vertical 9:16 cinematic frame."
+    )
+    text_parts=[
+        "Photorealistic cinematic film still. "+frame_guidance,
+        "Depict the action and the named subjects; correct anatomy, coherent environment, "
+        "dramatic but believable lighting. No captions, no collages, no extra characters.\n",
+        f"PRIMARY ACTION (must be visible): {shot.action}",
+        f"SHOT NAME: {shot.name}",
+        f"CAMERA: world position {list(shot.position)} m, looking at {list(shot.target)} m, "
+        f"field of view {shot.fov} degrees, roll {shot.roll} degrees.",
+        f"SCENE: {scene.title}. {scene.description[:2400]}",
+        f"SPACE: {scene.room.width}m wide x {scene.room.depth}m deep x {scene.room.height}m high; "
+        "world origin at room centre; +Y points up.",
+        "BLOCKING AND MAIN OBJECTS:\n"+"\n".join(object_lines),
+        "SPATIAL RELATIONSHIPS:\n"+("\n".join(relation_lines) if relation_lines else "No explicit relations"),
+        "Maintain the blocking, framing, subjects and object counts. "
+        "Treat positions and dimensions as approximate visual guidance."
+    ]
+    return "\n".join(text_parts)[:9900]
+
+
+def stability_image_endpoint(model:str,with_reference:bool)->tuple[str,str]:
+    """Return (endpoint, effective model). Reference images use Structure Control."""
+    if with_reference:
+        return ('https://api.stability.ai/v2beta/stable-image/control/structure', 'structure')
+    selected=model.strip().lower()
+    if selected not in {'core','ultra'}:
+        raise HTTPException(500,'IMAGE_MODEL must be "core" or "ultra" for text-to-image.')
+    return (f'https://api.stability.ai/v2beta/stable-image/generate/{selected}',selected)
+
+
+def reference_image_mime(raw:bytes)->str:
+    """Allow only supported input image formats; no dependency on Pillow."""
+    if raw.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if raw.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if len(raw)>12 and raw[:4]==b'RIFF' and raw[8:12]==b'WEBP':
+        return 'image/webp'
+    raise HTTPException(415,'Reference image must be a PNG, JPEG, or WebP file.')
+
+
+async def invoke_image(
+    prompt:str,
+    model:str,
+    request_log:dict,
+    reference_image:tuple[str,bytes]|None=None
+)->tuple[str,str]:
+    """Send the shot action prompt to Stability AI; optionally send a structural reference."""
+    key=os.getenv('STABILITY_API_KEY','').strip()
+    if not key:
+        raise HTTPException(503,'Set STABILITY_API_KEY in backend/.env and restart the server.')
+
+    has_reference=reference_image is not None
+    endpoint,effective_model=stability_image_endpoint(model,has_reference)
+    request_log.update(effective_model=effective_model,mode='image_guided' if has_reference else 'text_to_image')
+
+    fields={
+        'prompt': (None,prompt),
+        'output_format': (None,'png'),
+    }
+    if has_reference:
+        filename,content=reference_image
+        fields['image']=(filename,content,reference_image_mime(content))
+        fields['control_strength']=(None,'0.75')
+        # Structure Control follows the uploaded image's layout/aspect ratio;
+        # the endpoint does not accept a text-to-image aspect_ratio field.
+    else:
+        fields['aspect_ratio']=(None,'9:16')
+
+    request_started=time.monotonic()
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(IMAGE_REQUEST_TIMEOUT_SECONDS,connect=5)
+        ) as client:
+            response=await client.post(
+                endpoint,
+                headers={
+                    'Authorization':f'Bearer {key}',
+                    'Accept':'image/*',
+                },
+                files=fields,
+            )
+    finally:
+        request_log['upstream_request_seconds']=round(time.monotonic()-request_started,3)
+
+    request_log['upstream_http_status']=response.status_code
+    response.raise_for_status()
+
+    mime_type=response.headers.get('content-type','').split(';',1)[0].strip().lower()
+    image_bytes=response.content
+    if not mime_type.startswith('image/') or not image_bytes:
+        raise ValueError('Stability AI returned an empty or non-image response.')
+    request_log['image_bytes']=len(image_bytes)
+    return mime_type,base64.b64encode(image_bytes).decode('ascii')
+
 @app.get('/api/examples')
 def examples():
     return [json.loads(p.read_text()) for p in sorted((BASE/'examples').glob('*.json'))]
@@ -277,6 +399,110 @@ async def invoke_with_retries(prompt:str,requests:list[dict],request_budget:dict
             logger.info('LLM request model=%s duration_seconds=%.3f upstream_http_status=%s failure_category=%s',model,request_log['request_duration_seconds'],200,'none')
             return raw
     raise HTTPException(503,'Gemini request attempt limit reached before a scene response was produced.')
+
+async def create_scene_image_common(
+    scene:Scene,
+    shot_id:str,
+    reference_image:tuple[str,bytes]|None=None,
+)->dict:
+    shot=next((candidate for candidate in scene.shots if candidate.id==shot_id),None)
+    if shot is None:
+        raise HTTPException(404,'Shot not found in the supplied scene.')
+    if SLOTS.locked():
+        raise HTTPException(429,'A scene or image is being generated. Try again shortly.')
+
+    model=(os.getenv('IMAGE_MODEL') or DEFAULT_IMAGE_MODEL).strip()
+    request_started=time.monotonic()
+    request_log={'model':model,'shot_id':shot.id,'upstream_http_status':None}
+    prompt=build_image_prompt(scene,shot,reference_image is not None)
+    request_log.update(prompt_chars=len(prompt),shot_action=shot.action)
+    logger.info('Scene image stage=prompt_built image_provider=stability shot_id=%s chars=%d has_reference=%s',
+                shot.id,len(prompt),reference_image is not None)
+
+    async with SLOTS:
+        try:
+            async with asyncio.timeout(IMAGE_RESPONSE_DEADLINE_SECONDS):
+                mime_type,data_base64=await invoke_image(prompt,model,request_log,reference_image)
+            logger.info('Scene image stage=success shot_id=%s model=%s bytes=%d',
+                        shot.id,request_log['effective_model'],request_log['image_bytes'])
+            # Keep original fields (model, mime_type, data_base64) for React compatibility.
+            return {
+                'model':request_log['effective_model'],
+                'mime_type':mime_type,
+                'data_base64':data_base64,
+                'provider':'stability',
+                'shot_id':shot.id,
+                'action_prompt':shot.action,
+                'prompt':prompt,
+                'reference_used':reference_image is not None,
+            }
+        except TimeoutError as exc:
+            raise HTTPException(504,f'Image generation exceeded {IMAGE_RESPONSE_DEADLINE_SECONDS} seconds.') from exc
+        except httpx.HTTPStatusError as exc:
+            response=exc.response
+            try:
+                data=response.json()
+            except ValueError:
+                data={}
+            if not isinstance(data,dict):
+                data={}
+            errors=data.get('errors')
+            if isinstance(errors,list) and errors:
+                reason='; '.join(str(item) for item in errors[:3])
+            else:
+                reason=str(data.get('message') or response.reason_phrase or 'Unknown provider error')
+            key=os.getenv('STABILITY_API_KEY','')
+            if key:
+                reason=reason.replace(key,'[REDACTED]')
+            reason=reason[:600]
+            logger.warning('Stability image generation failed status=%d shot_id=%s reason=%s',
+                           response.status_code,shot.id,reason)
+            if response.status_code==402:
+                reason+=' (Insufficient Stability AI credits; check platform.stability.ai/account/credits.)'
+            status_code=response.status_code if response.status_code in {400,401,402,403,404,413,422,429,503} else 502
+            raise HTTPException(status_code,f'Stability AI returned HTTP {response.status_code}: {reason}') from exc
+        except httpx.TimeoutException as exc:
+            raise HTTPException(504,f'Stability AI timed out after {IMAGE_REQUEST_TIMEOUT_SECONDS} seconds.') from exc
+        except httpx.RequestError as exc:
+            logger.warning('Stability connection failure: %s',type(exc).__name__)
+            raise HTTPException(502,'Could not reach Stability AI.') from exc
+        except ValueError as exc:
+            raise HTTPException(502,'Stability AI returned an invalid image response.') from exc
+
+
+@app.post('/api/scene-image')
+async def create_scene_image(req:SceneImageRequest):
+    """Existing JSON endpoint: scene and shot_id -> Stability Core image."""
+    return await create_scene_image_common(req.scene,req.shot_id)
+
+
+@app.post('/api/scene-image/upload')
+async def create_scene_image_upload(
+    scene_json:str=Form(...),
+    shot_id:str=Form(...),
+    reference_image:UploadFile=File(...),
+):
+    """Multipart endpoint: scene JSON + shot_id + one reference image.
+
+    A Three.js viewport screenshot is ideal because Stability Structure
+    Control uses its edges and composition to guide the generated frame.
+    """
+    try:
+        scene=Scene.model_validate_json(scene_json)
+    except ValidationError as exc:
+        raise HTTPException(422,{'message':'Invalid scene_json','errors':exc.errors(include_url=False,include_context=False)}) from exc
+    except ValueError as exc:
+        raise HTTPException(422,'scene_json must be a valid JSON scene.') from exc
+
+    content=await reference_image.read(MAX_REFERENCE_IMAGE_BYTES+1)
+    if not content:
+        raise HTTPException(400,'Reference image is empty.')
+    if len(content)>MAX_REFERENCE_IMAGE_BYTES:
+        raise HTTPException(413,'Reference image exceeds the 10 MB application limit.')
+    mime_type=reference_image_mime(content)
+    ext={'image/png':'png','image/jpeg':'jpg','image/webp':'webp'}[mime_type]
+    filename=f'reference.{ext}'
+    return await create_scene_image_common(scene,shot_id,(filename,content))
 
 @app.post('/api/scene')
 async def create_scene(req:SceneRequest):

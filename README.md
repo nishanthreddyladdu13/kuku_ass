@@ -33,6 +33,7 @@ LLM_PROVIDER=gemini
 LLM_MODEL=your_available_structured_output_model_id
 LLM_API_KEY=your_key_here
 LLM_BASE_URL=
+IMAGE_MODEL=gemini-nano-banana-2.1
 ```
 
 Select a model ID actually available to your Google API account. No model is silently assumed. Restart FastAPI after editing. The provider uses the configured `LLM_MODEL` with Gemini's `generateContent` REST endpoint via HTTPX; no SDK installation is needed. A live response must satisfy the Pydantic JSON schema. Structured output is capped at 4096 tokens. One repair attempt is allowed. Gemini HTTP 503 responses receive at most three total provider requests per scene, including a repair request, with jittered exponential backoff; each request is bounded to 20 seconds and the full scene to 70 seconds. Logs record stage timings and request/schema sizes without logging prompts, API keys or request headers. New input generation returns an explicit error without configured access.
@@ -47,6 +48,10 @@ LLM_BASE_URL=https://your-provider.example/v1
 ```
 
 A ChatGPT subscription is not automatically an API credential. Never paste keys into the React code, screenshots, repository or submission. This local app is not authenticated: do not expose its generation endpoint publicly without adding authentication and quotas.
+
+## Generate a scene image
+
+The scene workspace can generate one image for the selected shot. `POST /api/scene-image` accepts the current validated `scene` and a `shot_id`, then builds a cinematic prompt from the scene layout and that shot's camera/action. The request uses the existing server-side `LLM_API_KEY` and Gemini's Interactions API; the key is never sent to the browser. `IMAGE_MODEL` optionally selects an image-capable Gemini model and defaults to `gemini-nano-banana-2.1`. The image request is made once (no retries) and has a 120-second upstream timeout and a 130-second overall deadline. The response includes the image MIME type and base64 data. Generated images are review drafts; the frontend displays them and includes them in the exported reference pack.
 
 ## Development: two terminals
 
@@ -70,13 +75,13 @@ Open http://localhost:5173. Vite proxies `/api` to FastAPI. Rebuild with `npm.cm
 
 | File | Responsibility |
 | --- | --- |
-| `frontend/src/main.tsx` | React UI, API calls, editing, ZIP export, manual media review |
+| `frontend/src/main.tsx` | React UI, API calls, editing, ZIP export, generated-image and manual media review |
 | `frontend/src/model.ts` | Frontend Zod schema, scene types and movement sampling |
 | `frontend/src/scene.ts` | Three.js geometry constructors, cameras and export metadata |
 | `frontend/src/engine.ts` | Viewport, orbit control, GPU/depth export and CPU fallback |
 | `frontend/src/raster.ts` | Software rasterizer when WebGL is unavailable |
 | `frontend/vite.config.ts` | Frontend server and FastAPI proxy |
-| `backend/app/main.py` | FastAPI app, REST provider adapter, one repair attempt, run logging |
+| `backend/app/main.py` | FastAPI app, scene/image REST provider adapters, validation and run logging |
 | `backend/app/models.py` | Pydantic schema, basic bounds and relationship checks |
 | `backend/examples` | Three clearly labelled hand-authored scenes |
 | `backend/tests/test_api.py` | API validation and simulated-provider tests |
@@ -90,7 +95,7 @@ Units: metres. Origin: room centre. +Y up. Object position: bottom centre. Rotat
 
 ## Data flow
 
-React text -> POST `/api/scene` -> server-side model -> Pydantic validation/one repair -> scene JSON -> frontend Zod validation -> Three.js -> user edits -> PNG/JSON/ZIP.
+React text -> POST `/api/scene` -> server-side model -> Pydantic validation/one repair -> scene JSON -> frontend Zod validation -> Three.js -> user edits -> PNG/JSON/ZIP. A selected scene/shot can also go to POST `/api/scene-image` -> server-side Gemini image model -> reviewed image preview/export.
 
 - GET `/api/health`: configuration status (never keys).
 - GET `/api/examples`: local sample scenes.
@@ -102,9 +107,9 @@ The generated raw responses and original prompts are stored under `backend/data/
 
 ## Part B — manual handoff
 
-Download the camera preview and action prompt. Create an appearance image externally, compare it with the preview, then generate a clip in a supported image-to-video service. Use the Handoff tab to import the results, add notes and export them. Media/notes are temporary until export. Save each accepted and rejected attempt before changing scenes or shots.
+Generate an appearance image for a selected shot or download the camera preview and action prompt to create one externally. Compare it with the preview, then generate a clip in a supported image-to-video service. Use the Handoff tab to review/import results, add notes and export them. Media/notes are temporary until export. Save each accepted and rejected attempt before changing scenes or shots.
 
-No image/video service is connected. No model is guaranteed to accept the exported depth maps. Depth is a diagnostic reference: 8-bit linear camera-forward distance over 0.1–40m, white near and black far. Generated MP4s are external, not outputs of the app itself.
+No video service is connected. No model is guaranteed to accept the exported depth maps. Depth is a diagnostic reference: 8-bit linear camera-forward distance over 0.1–40m, white near and black far. Generated MP4s are external, not outputs of the app itself.
 
 ## Testing
 

@@ -83,6 +83,70 @@ class ApiTests(unittest.TestCase):
         record=json.loads(next(Path(self.temp.name).glob('*.json')).read_text())
         self.assertEqual(record['provider_requests'][0]['upstream_http_status'],200)
         self.assertEqual(record['provider_requests'][0]['model'],record['model'])
+    def test_scene_image_uses_configured_model_and_returns_image(self):
+        image_data='aGVsbG8='
+        response=httpx.Response(200,json={'output_image':{'data':image_data,'mime_type':'image/png'}},request=httpx.Request('POST','https://generativelanguage.googleapis.com/v1beta/interactions'))
+        class FakeClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self,*args): return False
+            async def post(self,url,headers,json):
+                self.url=url;self.headers=headers;self.payload=json
+                return response
+        fake=FakeClient()
+        with patch.dict(os.environ,{'LLM_API_KEY':'test-key','IMAGE_MODEL':'test-image-model','LLM_PROVIDER':'gemini'}),patch.object(main.httpx,'AsyncClient',return_value=fake):
+            r=self.client.post('/api/scene-image',json={'scene':self.example,'shot_id':self.example['shots'][0]['id']})
+        self.assertEqual(r.status_code,200,r.text)
+        self.assertEqual(r.json(),{'model':'test-image-model','mime_type':'image/png','data_base64':image_data})
+        self.assertEqual(fake.url,'https://generativelanguage.googleapis.com/v1beta/interactions')
+        self.assertEqual(fake.headers['Api-Revision'],'2026-05-20')
+        self.assertEqual(fake.payload['model'],'test-image-model')
+        self.assertFalse(fake.payload['store'])
+        self.assertIn(self.example['title'],fake.payload['input'][0]['text'])
+        self.assertIn(self.example['shots'][0]['name'],fake.payload['input'][0]['text'])
+        self.assertIn(self.example['shots'][0]['action'],fake.payload['input'][0]['text'])
+        self.assertIn('Assumptions:',fake.payload['input'][0]['text'])
+        self.assertIn('Unsupported elements:',fake.payload['input'][0]['text'])
+        self.assertNotIn('test-key',r.text)
+    def test_scene_image_reports_upstream_503_without_retry(self):
+        request=httpx.Request('POST','https://generativelanguage.googleapis.com/v1beta/interactions')
+        response=httpx.Response(503,json={'error':{'status':'UNAVAILABLE','message':'Image service is busy.'}},request=request)
+        class FakeClient:
+            calls=0
+            async def __aenter__(self): return self
+            async def __aexit__(self,*args): return False
+            async def post(self,*args,**kwargs):
+                self.calls+=1
+                return response
+        fake=FakeClient()
+        with patch.dict(os.environ,{'LLM_API_KEY':'test-key','IMAGE_MODEL':'test-image-model'}),patch.object(main.httpx,'AsyncClient',return_value=fake):
+            r=self.client.post('/api/scene-image',json={'scene':self.example,'shot_id':self.example['shots'][0]['id']})
+        self.assertEqual(r.status_code,503)
+        self.assertIn('UNAVAILABLE',r.json()['detail'])
+        self.assertIn('after 1 attempt(s)',r.json()['detail'])
+        self.assertEqual(fake.calls,1)
+    def test_scene_image_surfaces_upstream_quota_429(self):
+        request=httpx.Request('POST','https://generativelanguage.googleapis.com/v1beta/interactions')
+        response=httpx.Response(429,json={'error':{'status':'RESOURCE_EXHAUSTED','message':'Free Tier limit is zero requests per day.'}},request=request)
+        class FakeClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self,*args): return False
+            async def post(self,*args,**kwargs): return response
+        with patch.dict(os.environ,{'LLM_API_KEY':'test-key','IMAGE_MODEL':'test-image-model'}),patch.object(main.httpx,'AsyncClient',return_value=FakeClient()):
+            r=self.client.post('/api/scene-image',json={'scene':self.example,'shot_id':self.example['shots'][0]['id']})
+        self.assertEqual(r.status_code,429)
+        self.assertIn('zero requests per day',r.json()['detail'])
+        self.assertNotIn('test-key',r.text)
+    def test_scene_image_reports_timeout(self):
+        with patch.dict(os.environ,{'LLM_API_KEY':'test-key','IMAGE_MODEL':'test-image-model'}),patch.object(main,'invoke_image',new=AsyncMock(side_effect=httpx.ReadTimeout('timed out'))) as mock:
+            r=self.client.post('/api/scene-image',json={'scene':self.example,'shot_id':self.example['shots'][0]['id']})
+        self.assertEqual(r.status_code,504)
+        self.assertIn('timed out',r.json()['detail'])
+        self.assertEqual(mock.await_count,1)
+    def test_scene_image_rejects_unknown_shot_before_provider_call(self):
+        with patch.object(main,'invoke_image',new=AsyncMock()) as mock:
+            r=self.client.post('/api/scene-image',json={'scene':self.example,'shot_id':'missing-shot'})
+        self.assertEqual(r.status_code,404)
+        mock.assert_not_awaited()
     def test_gemini_schema_is_inlined_without_unsupported_array_bounds(self):
         response_schema=main.gemini_response_schema()
         def schema_keys(node):

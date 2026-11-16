@@ -63,6 +63,9 @@ class Scene(StrictModel):
         return self
 class SceneRequest(StrictModel):
     script: str = Field(min_length=10,max_length=8000)
+class SceneImageRequest(StrictModel):
+    scene: Scene
+    shot_id: str = Field(pattern=r'^[a-zA-Z0-9_-]{1,50}$')
 
 def spatial_warnings(scene: Scene):
     warnings=[]
